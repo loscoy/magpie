@@ -27,6 +27,7 @@ import (
 
 	"github.com/yetone/magpie/internal/appdir"
 	"github.com/yetone/magpie/internal/catalog"
+	"github.com/yetone/magpie/internal/filelock"
 	"github.com/yetone/magpie/internal/lastgood"
 	"github.com/yetone/magpie/internal/settings"
 	"github.com/yetone/magpie/internal/steady"
@@ -440,6 +441,11 @@ type Provider struct {
 }
 
 type file struct {
+	// The bytes this edit was read from, before any backup recovery. store
+	// rejects a stale edit instead of undoing a concurrent provider rename.
+	source    []byte
+	loaded    bool
+	recovered bool
 	Providers []Provider `json:"providers"`
 	Groups    []Group    `json:"groups,omitempty"`
 	// Searches are the web search APIs a model's search goes to when no
@@ -492,19 +498,27 @@ func (e *unreadableError) Unwrap() []error { return []error{ErrUnreadable, e.err
 // Reads used for an edit must keep errors: a broken file is not an empty
 // catalog to write over. Only a missing file is a first use.
 func read() (file, error) {
+	return readProviders(true)
+}
+
+func readProviders(backup bool) (file, error) {
 	var f file
 	b, err := steady.ReadFile(Path())
 	if errors.Is(err, os.ErrNotExist) {
-		return f, nil
+		return file{loaded: true}, nil
 	}
 	if err != nil {
 		return f, &unreadableError{Path(), err}
 	}
+	source := b
 	// An editor that saves with a byte-order mark leaves JSON that Go's
 	// decoder refuses; read as broken, the file fell back to its .bak, an
 	// older generation without what was saved since (#1821).
 	b = bytes.TrimPrefix(b, utf8BOM)
 	if err := json.Unmarshal(b, &f); err != nil {
+		if !backup {
+			return file{}, &unreadableError{Path(), err}
+		}
 		// one left all zero by a crash (#1505) is its last good generation
 		bak, ferr := lastgood.Fallback(Path(), b, validProviders)
 		if ferr != nil {
@@ -514,7 +528,9 @@ func read() (file, error) {
 		if err := json.Unmarshal(bak, &f); err != nil {
 			return file{}, &unreadableError{Path(), err}
 		}
+		f.recovered = true
 	}
+	f.source, f.loaded = source, true
 	return f, nil
 }
 
@@ -560,8 +576,28 @@ func Routings() ([]string, error) {
 // file cut short.
 func store(f file) error {
 	p := Path()
+	if f.recovered {
+		return &unreadableError{p, errors.New("the backup may predate gateway key permissions; repair the current provider file before saving")}
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
+	}
+	// Check and replace under the same cross-process lock. No access
+	// callback runs while this lock is held, so the key-store lock can
+	// safely enclose a store when moving off a subscription id.
+	unlock, held := filelock.Lock(p+".lock", filelock.Wait)
+	if !held {
+		return errors.New("providers could not be locked; try saving again")
+	}
+	defer unlock()
+	if f.loaded {
+		current, err := steady.ReadFile(p)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if !bytes.Equal(current, f.source) {
+			return errors.New("providers changed during this edit; reload and try again")
+		}
 	}
 	// a group as it was read has the models its patterns matched then
 	// among its members: they are found again each time, never written
@@ -881,7 +917,9 @@ func Save(p Provider) error {
 	} else {
 		// a new provider under an id another had: what was recorded under
 		// it until now stays that one's
-		giveID(f.Providers, -1, p.ID, time.Now())
+		if err := giveID(f.Providers, -1, p.ID, time.Now()); err != nil {
+			return err
+		}
 		f.Providers = append(f.Providers, p)
 	}
 	if err := store(f); err != nil {

@@ -40,6 +40,9 @@ func (who Identity) Restricted() bool { return len(who.Models) > 0 || len(who.Ac
 // lists none. The accounts a key may be held to say nothing of its
 // models: they hold the candidates of a plan, not its models.
 func (who Identity) Allows(ids ...string) bool {
+	if !who.currentProviders() {
+		return false
+	}
 	if len(who.Models) == 0 {
 		return true
 	}

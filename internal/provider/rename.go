@@ -61,9 +61,16 @@ func Rename(from, to string) error {
 	if slices.ContainsFunc(f.Providers, func(p Provider) bool { return p.ID == to }) {
 		return fmt.Errorf("there is a provider %q already", to)
 	}
+	if SyncAccessRenames != nil {
+		if err := SyncAccessRenames(); err != nil {
+			return err
+		}
+	}
 	// an id another provider once had is this one's now; the calls
 	// recorded under it until now stay that one's
-	giveID(f.Providers, i, to, time.Now())
+	if err := giveID(f.Providers, i, to, time.Now()); err != nil {
+		return err
+	}
 	p := &f.Providers[i]
 	p.Was = slices.DeleteFunc(p.Was, func(w string) bool { return w == to })
 	p.ID = to
@@ -103,13 +110,23 @@ func Rename(from, to string) error {
 	// the vendor's list last fetched goes with it
 	os.Rename(catalog.LivePath(from), catalog.LivePath(to))
 	os.Rename(catalog.LivePath(decisionsID(from)), catalog.LivePath(decisionsID(to)))
-	if err := store(f); err != nil {
+	var accessErr error
+	if sub && RenameAccessWithoutAlias != nil {
+		stored, err := RenameAccessWithoutAlias(from, to, func() error { return store(f) })
+		if !stored {
+			return err
+		}
+		accessErr = err
+	} else if err := store(f); err != nil {
 		return err
+	}
+	if SyncAccessRenames != nil {
+		if err := SyncAccessRenames(); err != nil {
+			accessErr = errors.Join(accessErr, fmt.Errorf("provider renamed; gateway key restrictions could not be saved: %w", err))
+		}
 	}
 	// so is its StepFun sign-in, kept by provider id
-	if err := renameStepFun(from, to); err != nil {
-		return err
-	}
+	stepErr := renameStepFun(from, to)
 	s := settings.Load()
 	changed := renameModelPrefs(&s, from, to)
 	for a, names := range s.Visible {
@@ -120,9 +137,9 @@ func Rename(from, to string) error {
 		}
 	}
 	if changed {
-		return settings.Save(s)
+		return errors.Join(accessErr, stepErr, settings.Save(s))
 	}
-	return nil
+	return errors.Join(accessErr, stepErr)
 }
 
 // renamedRef is a model id ("provider/model", "magpie/provider/model")
@@ -153,6 +170,52 @@ func RenamedRef(ref string) string {
 // that a provider or a subscription has now is that one's, and is not
 // in it.
 func Renamed() map[string]string { return UsageRenames().now }
+
+// ReadRenamed reads the current aliases and their provider-id version for
+// access checks. Both come from the same read, so a rename between reads
+// cannot pair old restrictions with a new version. Unlike usage, permissions
+// cannot use an older mapping when the file is unreadable.
+func ReadRenamed() (map[string]string, string, error) {
+	f, err := readProviders(false)
+	if err != nil {
+		return nil, "", err
+	}
+	ids := make([]string, 0, len(f.Providers))
+	for _, p := range f.Providers {
+		ids = append(ids, p.ID)
+	}
+	slices.Sort(ids)
+	r := renamesOf(f.Providers)
+	return r.now, strings.Join(ids, "/") + ":" + r.Key(), nil
+}
+
+// AccessRenameVersion identifies the provider ids and their aliases for a
+// request. It shares the routing catalog's Hold and invalidation: a key
+// authenticated before a rename must not use its old account prefixes with
+// a new catalog. Checking each candidate does not rebuild the provider list.
+func AccessRenameVersion() (string, error) {
+	type version struct {
+		key string
+		err error
+	}
+	v := heldOf("access-renames", func() version {
+		_, key, err := ReadRenamed()
+		return version{key: key, err: err}
+	})
+	return v.key, v.err
+}
+
+// SyncAccessRenames is installed by access, which owns caller-keys.json.
+// It saves restrictions under the current ids before an alias is given
+// away, and after a rename. A failure before storing stops the rename;
+// one after is returned alongside errors from the remaining migrations.
+var SyncAccessRenames func() error
+
+// RenameAccessWithoutAlias is installed by access for a legacy custom
+// provider moving off a subscription id. That id cannot become a Was alias.
+// The callback keeps affected keys disabled durably across the store and
+// returns whether the provider was stored, even when finishing access failed.
+var RenameAccessWithoutAlias func(from, to string, store func() error) (bool, error)
 
 // Gave is an id a provider had and gave up to another (Provider.Gave).
 type Gave struct {
@@ -268,7 +331,14 @@ func renamesOf(ps []Provider) Renames {
 // (-1 for one not among them) into its Gave at now: from now on id is
 // another's, and what was recorded under it before stays the one's that
 // had it.
-func giveID(ps []Provider, taker int, id string, now time.Time) {
+func giveID(ps []Provider, taker int, id string, now time.Time) error {
+	if SyncAccessRenames != nil && slices.ContainsFunc(ps, func(p Provider) bool {
+		return slices.Contains(p.Was, id)
+	}) {
+		if err := SyncAccessRenames(); err != nil {
+			return err
+		}
+	}
 	for j := range ps {
 		if j == taker || !slices.Contains(ps[j].Was, id) {
 			continue
@@ -276,6 +346,7 @@ func giveID(ps []Provider, taker int, id string, now time.Time) {
 		ps[j].Was = slices.DeleteFunc(ps[j].Was, func(w string) bool { return w == id })
 		ps[j].Gave = append(ps[j].Gave, Gave{ID: id, Until: now})
 	}
+	return nil
 }
 
 // OnAccountIDs are the user's own providers saved on a subscription's id,

@@ -66,6 +66,9 @@ func CleanAccounts(in []string) ([]string, error) {
 // it names**: a provider it names no account of, the key uses as it
 // always did, its every account and key. Any, for a key that lists none.
 func (who Identity) AllowsAccount(pid, ref string) bool {
+	if !who.currentProviders() {
+		return false
+	}
 	if len(who.Accounts) == 0 {
 		return true
 	}

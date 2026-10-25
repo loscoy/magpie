@@ -21,6 +21,7 @@ import (
 
 	"github.com/yetone/magpie/internal/edit"
 	"github.com/yetone/magpie/internal/filelock"
+	"github.com/yetone/magpie/internal/provider"
 	"github.com/yetone/magpie/internal/settings"
 )
 
@@ -144,6 +145,7 @@ type Identity struct {
 	Models         []string
 	Accounts       []string
 	Quotas         bool
+	renameVersion  string
 }
 type contextKey struct{}
 
@@ -160,16 +162,27 @@ var mu = filelock.Mutex{Path: func() string { return Path() + ".lock" }}
 func Path() string { return filepath.Join(settings.Dir(), "caller-keys.json") }
 
 func load() ([]Key, error) {
+	keys, _, err := loadVersioned()
+	return keys, err
+}
+
+func loadVersioned() ([]Key, string, error) {
 	b, err := os.ReadFile(Path())
 	if errors.Is(err, os.ErrNotExist) {
-		return []Key{}, nil
+		return []Key{}, "", nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	var keys []Key
-	err = json.Unmarshal(b, &keys)
-	return keys, err
+	if err := json.Unmarshal(b, &keys); err != nil {
+		return nil, "", err
+	}
+	version, err := repairProviderRefs(keys)
+	if err != nil {
+		return nil, "", err
+	}
+	return keys, version, nil
 }
 
 // List never returns credentials; only the administrator's copy action does.
@@ -431,6 +444,15 @@ func Update(action string, in Change) (string, error) {
 			if err != nil {
 				return "", err
 			}
+			if len(ms) > 0 {
+				renames, _, err := provider.ReadRenamed()
+				if err != nil {
+					return "", err
+				}
+				for j, ref := range ms {
+					ms[j] = renamedProviderRef(ref, renames)
+				}
+			}
 			keys[i].Models = ms
 		case "accounts-key":
 			as, err := CleanAccounts(in.Accounts)
@@ -492,7 +514,7 @@ func setLegacyMirror(s *settings.Settings, k Key) error {
 func Authenticate(secret string) (Identity, bool) {
 	mu.Lock()
 	defer mu.Unlock()
-	keys, err := load()
+	keys, version, err := loadVersioned()
 	if err != nil || secret == "" {
 		return Identity{}, false
 	}
@@ -501,7 +523,11 @@ func Authenticate(secret string) (Identity, bool) {
 			if k.Off {
 				return Identity{}, false
 			}
-			return Identity{KeyID: k.ID, KeyName: k.Name, Limit: k.Limit, More: k.More, Models: k.Models, Accounts: k.Accounts, Quotas: k.Quotas}, true
+			who := Identity{KeyID: k.ID, KeyName: k.Name, Limit: k.Limit, More: k.More, Models: k.Models, Accounts: k.Accounts, Quotas: k.Quotas}
+			if who.Restricted() {
+				who.renameVersion = version
+			}
+			return who, true
 		}
 	}
 	s := settings.Load()

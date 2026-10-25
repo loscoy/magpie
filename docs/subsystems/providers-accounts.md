@@ -58,6 +58,93 @@ keys and accounts per request is in [Gateway routing and fallback](gateway-routi
 | Protocol detection | Works out which of Chat, Responses, Anthropic Messages and Gemini generateContent a base URL speaks when a provider is added. Each is asked at the URL as it takes it (`DetectBase`); Gemini's at the `…/v1beta` beside a typed `…/v1` or bare host, a Gemini model from the list picked for it, with the key in `x-goog-api-key` (#1346). Detection, endpoint tests and model tests share `probe`, which adds `anthropic-version` only for Anthropic Messages; OpenAI probes omit that default so a relay that refuses it can answer. User-supplied headers still apply through `Sign`. The editor asks with the form as it stands, before any Save (#1545): the URL, key and models typed (`picked`, else the saved picks, else the vendor list); a key not typed again is the saved provider's, or for an unsaved copy the copied one's (`copyOf`). The probe writes nothing and adds no provider, and the route stays behind `magpie web`'s key. | [`detect.go`](../../internal/provider/detect.go), [`test.go`](../../internal/provider/test.go) |
 | A pasted curl command | A curl command from a vendor's docs pasted into a custom provider's Base URL or API key fills the editor in (@mark_li21 on X). `curlOf` reads it as a shell would (lines joined by `\`, cmd's `^` or PowerShell's backtick; `curl.exe`; quotes and escapes), and takes: the API its URL's endpoint names (`…/chat/completions` Chat, `…/messages` Anthropic Messages, `…/responses` Responses) with the base URL before it, spelled as that API wants it (`respellURL`: Anthropic at its root, `/v1` after a bare host); the key from `Authorization: Bearer`, `x-api-key` or `api-key`, unless it only stands for one (`$OPENAI_API_KEY`, `${X}`, `%X%`, `<token>`, `YOUR_API_KEY`), when the key's box is left empty and focused; and the `model` of its JSON body, added to a new provider's models (a saved one's picks are left alone, since adding to none would narrow what it serves). A preset's editor takes only the key. A note (`editorError`, kind `note`) says what was taken, a placeholder like `{WorkspaceId}` left in the URL, and a URL with no known endpoint. Text that isn't a curl command pastes as before, several keys included. Tested on the docs' own examples (`fixtures/curl`). | [`app.js`](../../internal/gui/assets/app.js) (`curlOf`, `fromCurl`), [`provider-curl-paste.test.cjs`](../../internal/gui/tests/provider-curl-paste.test.cjs) |
 
+## Gateway key restrictions across provider renames
+
+`access` owns the Models and Accounts lists in `caller-keys.json`. Its
+[`rename.go`](../../internal/access/rename.go) installs
+`provider.SyncAccessRenames`, avoiding a provider-to-access import cycle.
+`Rename` checks the key store before changing the provider, then saves the
+lists under the new id immediately after the provider is stored, before
+StepFun, settings or agent config updates can fail. Only a literal provider
+component is changed, case-insensitively; model globs, account fingerprints,
+groups, other providers and unrestricted lists keep their meaning.
+
+Reading keys also repairs older references using the current `Was` mapping
+and persists the repair under the caller-key file lock. Incoming model
+selections are normalized under that lock too, before saving, so an old
+picker cannot leave a permission for an alias about to be reused.
+Normalization happens at the key-store boundary, never per model or
+candidate. Authenticated
+restrictions keep the provider-id version they were read against. If routing
+observes another version during that request, subsequent checks refuse it;
+the next request authenticates with the repaired lists. This version shares
+the routing catalog's `Hold` cache and invalidation, including its bound for
+observing another process's edits; checks do not rescan the provider list
+for every candidate. A current provider or subscription id is never
+interpreted as another provider's old id. `giveID`, for both `Rename` and
+`Save`, requires existing restrictions to
+be repaired before giving an alias away. References whose id was already
+reused before the repair cannot be attributed safely and are left as saved.
+
+A malformed key store stops the rename before the provider changes. The
+provider and key files are separate atomic writes: if the key write fails
+after the provider write, the error explicitly says the provider was renamed.
+StepFun and settings migrations still run, and their errors are joined with
+the caller-key error. Agent config updates remain subject to the existing
+`agent.RenameProvider` rule: a provider rename error returns before those
+updates.
+Subsequent key reads retry the repair; while it cannot be saved they refuse
+authentication. An unreadable provider list fails restricted checks closed
+instead of treating its aliases as empty. Permission reads never fall back
+to `providers.json.bak`: its older ids can disagree with already-migrated
+account restrictions, even though ordinary catalog reads may recover it.
+An edit read from that backup cannot be saved over the corrupt current
+file: doing so would make the old ids authoritative again without repairing
+the key restrictions. The current provider file must be repaired first.
+
+Every provider edit read from disk carries its original bytes. `store`
+compares them with the current file under a cross-process lock before
+replacing it. A concurrent edit, including another rename, makes a stale
+save fail with a reload-and-retry error instead of overwriting newer ids.
+Failure to acquire the lock also refuses the write. No access callback
+runs under this provider write lock, so legacy migration can safely hold
+the key-store lock while storing the provider. This is not a transaction
+across all provider, key and agent files.
+
+For a legacy custom provider saved on a subscription's id, the old id must
+remain the subscription's and is deliberately absent from `Was`.
+`RenameAccessWithoutAlias` therefore migrates the literal references
+explicitly. Under the caller-key lock it saves affected keys disabled with
+their new references, stores the provider, then restores each key's previous
+enabled state. A failed provider write restores the original keys; if that
+restore fails too, the error says the keys remain disabled and their
+references must be restored before enabling them. A failed final key write
+after the provider moved leaves the new references disabled and reports it;
+the administrator can enable those keys again after writes work. An already
+disabled key stays disabled, and unrelated keys are untouched. No alias to
+the custom provider is added for the subscription id. A crash between these
+writes can likewise leave affected keys disabled, so this rare legacy path
+trades automatic recovery for a durable closed state.
+
+`internal/access/rename_test.go` covers persisted restrictions, chained and
+reversed renames, both ways to reuse an id, invalid stores, failed writes,
+recovery, backup fallback, overlapping renames and current
+provider/subscription ids. `rename_legacy_test.go`
+covers the public `Rename` path off a subscription id, each failed write,
+rollback failure and re-enabling a key after the final write failed.
+`TestProviderRenameGatewayMatrix` in
+[`provider_rename_access_test.go`](../../internal/gateway/provider_rename_access_test.go)
+sends real HTTP requests through the gateway and LAN guard to a local fake
+upstream. Both old and new request ids still resolve to the renamed provider.
+Before the repair, an unrestricted model list or a list naming the new id
+allowed both request ids; a list naming only the old id refused both. An
+account list naming the old id allowed an unselected upstream key. The
+repair makes both model ids work with the retained restrictions and keeps
+the unselected key out. Unrelated-model and removed-account controls still
+return 403. Run these with
+`go test -tags nogui ./internal/access ./internal/gateway -run 'TestProvider'`
+in the sandbox HOME described below.
+
 ## Remote magpie
 
 The `remote-magpie` preset is of its own kind, `KindRemote` (`remote`), not
