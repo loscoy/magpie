@@ -240,6 +240,84 @@ const accountShown = (a) => gatewayAccountNames[a] || a;
 // providers' poll) doesn't drop the click
 let keyModelsLoading = null;
 
+// Arrange permission rules by their owner, keeping the shared menu's
+// selection and save-on-close behavior. Folding never selects a rule.
+function gatewayKeyGroups(box, opts, items, isOn) {
+  const groups = new Map();
+  let query = "";
+  const words = opts.map((o) => [o.literalName ? o.name : t(o.name), t(o.note), o.v, o.groupName].join(" ").toLocaleLowerCase());
+  opts.forEach((o, i) => {
+    if (!o.group) return;
+    let g = groups.get(o.group);
+    if (!g) {
+      const body = el("div", "pm-group"), fold = el("button", "am-fold"), rows = el("div", "pm-group-rows");
+      fold.type = "button";
+      fold.setAttribute("role", "menuitem");
+      fold.append(el("span", "tw", "▾"), el("span", "gn", o.groupName), el("span", "c"));
+      body.append(fold, rows);
+      items[i].before(body);
+      g = { body, fold, rows, members: [], shut: false };
+      groups.set(o.group, g);
+      fold.onclick = (e) => { e.stopPropagation(); g.shut = !g.shut; update(query); };
+    }
+    g.members.push(i);
+    if (o.section && o.section !== g.section) {
+      g.rows.append(el("div", "pm-section", t(o.section)));
+      g.section = o.section;
+    }
+    g.rows.append(items[i]);
+  });
+  for (const g of groups.values()) {
+    g.shut = g.members.length > 8;
+    if (!opts[g.members[0]].group.startsWith("provider:") && opts[g.members[0]].group !== "group") continue;
+    const all = g.members.find((i) => opts[i].v.endsWith("/*"));
+    if (all === undefined) continue;
+    const pick = el("button", "pm-group-pick"), head = el("div", "pm-group-head");
+    pick.type = "button";
+    pick.setAttribute("role", "menuitemcheckbox");
+    pick.setAttribute("aria-label", opts[all].literalName ? opts[all].name : t(opts[all].name));
+    pick.title = pick.getAttribute("aria-label");
+    g.fold.before(head);
+    head.append(pick, g.fold);
+    g.pick = pick;
+    g.all = all;
+    g.models = g.members.filter((i) => opts[i].section !== "Accounts");
+    pick.onclick = (e) => {
+      e.stopPropagation();
+      const was = isOn(opts[all].v);
+      for (const i of g.models) if (isOn(opts[i].v)) items[i].click();
+      if (!was) items[all].click();
+    };
+  }
+  const empty = el("div", "pm-empty");
+  empty.setAttribute("role", "status");
+  box.append(empty);
+  const update = (q) => {
+    query = q;
+    items.forEach((b, i) => { b.hidden = !opts[i].always && !words[i].includes(q); });
+    for (const g of groups.values()) {
+      g.body.hidden = !g.members.some((i) => !items[i].hidden);
+      g.rows.hidden = !q && g.shut;
+      g.fold.setAttribute("aria-expanded", String(!g.rows.hidden));
+      g.fold.firstChild.textContent = g.rows.hidden ? "▸" : "▾";
+      g.fold.lastChild.textContent = t("{n} selected", { n: g.members.filter((i) => isOn(opts[i].v)).length });
+      if (g.pick) {
+        const state = isOn(opts[g.all].v) ? "true" : g.models.some((i) => isOn(opts[i].v)) ? "mixed" : "false";
+        g.pick.setAttribute("aria-checked", state);
+        g.pick.replaceChildren(...(state === "false" ? [] : [svg(state === "true" ? CHECK : "M4 8h8", 12, 1.9)]));
+      }
+      for (const label of g.rows.querySelectorAll(".pm-section")) {
+        let next = label.nextElementSibling, shown = false;
+        while (next && !next.classList.contains("pm-section")) { shown ||= !next.hidden; next = next.nextElementSibling; }
+        label.hidden = !shown;
+      }
+    }
+    empty.hidden = !q || items.some((b, i) => !opts[i].always && !b.hidden);
+    empty.textContent = empty.hidden ? "" : t("No models match “{q}”", { q });
+  };
+  return update;
+}
+
 // gatewayModelsBadge picks the models and the accounts a key may use, in
 // the app's menu: "All models" on hover when it may use any, else which
 // it may, always shown. A pick is sent when the menu closes.
@@ -259,7 +337,7 @@ function gatewayModelsBadge(k) {
   b.setAttribute("aria-expanded", "false");
   const open = (models, accounts) => {
     if (!b.isConnected) return;
-    const opts = [{ v: "", name: "All models", note: "Any model and any account, now and later" }];
+    const opts = [{ v: "", name: "All models", note: "Any model and any account, now and later", always: true }];
     const seen = new Set();
     // the accounts and keys the key may be held to (#905), each right
     // after its provider's models, not one block at the end: an account
@@ -276,7 +354,7 @@ function gatewayModelsBadge(k) {
       const note = as.length && !named.has(String(a.provider).toLowerCase())
         ? t("Used: no {provider} account is picked", { provider: a.providerName })
         : a.plan ? a.providerName + " · " + a.plan : a.providerName;
-      const o = { v: a.id, name: a.name, note, literalName: true };
+      const o = { v: a.id, name: a.name, note, literalName: true, group: "provider:" + a.provider, groupName: a.providerName, section: "Accounts" };
       ofProvider.set(a.provider, [...(ofProvider.get(a.provider) || []), o]);
     }
     let listed = "";  // the provider whose models the list is in
@@ -292,9 +370,9 @@ function gatewayModelsBadge(k) {
         endBlock();
         if (!seen.has("group")) {
           seen.add("group");
-          opts.push({ v: "group/*", name: "Every routing group", note: "group/*" });
+          opts.push({ v: "group/*", name: "Every routing group", note: "group/*", group: "group", groupName: t("Routing groups") });
         }
-        opts.push({ v: m.id, name: m.name, note: m.id, literalName: true });
+        opts.push({ v: m.id, name: m.name, note: m.id, literalName: true, group: "group", groupName: t("Routing groups") });
         continue;
       }
       if (m.provider !== listed) {
@@ -303,9 +381,9 @@ function gatewayModelsBadge(k) {
       }
       if (!seen.has(m.provider)) {
         seen.add(m.provider);
-        opts.push({ v: m.provider + "/*", name: t("Every {provider} model", { provider: m.providerName }), note: m.provider + "/*", literalName: true });
+        opts.push({ v: m.provider + "/*", name: t("Every {provider} model", { provider: m.providerName }), note: m.provider + "/*", literalName: true, group: "provider:" + m.provider, groupName: m.providerName, section: "Models" });
       }
-      opts.push({ v: m.id, name: m.name, note: m.id, literalName: true });
+      opts.push({ v: m.id, name: m.name, note: m.id, literalName: true, group: "provider:" + m.provider, groupName: m.providerName });
     }
     endBlock();
     // a provider with accounts and no model in the list (one kept
@@ -314,8 +392,8 @@ function gatewayModelsBadge(k) {
     // what the CLI kept that the list hasn't, a pattern, a model gone or
     // an account signed out: behind every live entry, a model gone
     // before an account signed out
-    for (const v of ms) if (!opts.some((o) => o.v === v)) opts.push({ v, name: v, note: "Not served now", literalName: true });
-    for (const v of as) if (!accountsSet.has(v)) { accountsSet.add(v); opts.push({ v, name: v, note: "Not signed in now", literalName: true }); }
+    for (const v of ms) if (!opts.some((o) => o.v === v)) opts.push({ v, name: v, note: "Not served now", literalName: true, group: "missing-models", groupName: t("Not served now") });
+    for (const v of as) if (!accountsSet.has(v)) { accountsSet.add(v); opts.push({ v, name: v, note: "Not signed in now", literalName: true, group: "missing-accounts", groupName: t("Not signed in now") }); }
     openProtoMenu(b, opts, [...ms, ...as], (picked) => {
       // one action at a time: gatewayKeyAction is busy while one is sent.
       // The accounts are sent only when they changed: a model picked says
@@ -329,7 +407,7 @@ function gatewayModelsBadge(k) {
           await gatewayKeyAction("accounts-key", { key: k.id, accounts: pickedAccounts });
         }
       })();
-    }, "Models this key may use", "sess-menu", "right");
+    }, "Models this key may use", "sess-menu key-model-menu", "right", false, "Search models", gatewayKeyGroups);
   };
   b.onclick = async (e) => {
     e.preventDefault();
