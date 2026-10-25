@@ -51,10 +51,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       await badge("server").click();
       await menu.waitFor();
       assert.deepEqual((await menu.locator(".pm-item.on").allTextContents()).map((s) => s.trim()), ["Fastgroup/fast"]);
-      await menu.locator(".pm-item", { hasText: w.groups }).click();
+      const groupPick = menu.locator(".pm-group-pick").first();
+      assert.equal(await groupPick.getAttribute("aria-checked"), "mixed");
+      await groupPick.click();
+      assert.equal(await groupPick.getAttribute("aria-checked"), "true");
       await page.keyboard.press("Escape");
       await menu.waitFor({ state: "detached" });
-      assert.deepEqual(events.filter((e) => e.action === "models-key").at(-1).body, { key: "server", models: ["group/*", "group/fast"] });
+      assert.deepEqual(events.filter((e) => e.action === "models-key").at(-1).body, { key: "server", models: ["group/*"] });
       assert.deepEqual(await scrolled(), at, "a click moved the page");
       // A red here under load (#1974) could not be made again: every rule
       // these match, and app.css's own button reset, set border: 0, so a
@@ -62,7 +65,10 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       // or the element isn't one these rules know. The message says which:
       // each element's tag, class, place and style, and each stylesheet with
       // how many rules it holds.
-      const lefts = await page.locator("#gatewayKeys .key-models, .proto-menu .pm-item").evaluateAll((els) => {
+      const lefts = await page.evaluate(() => {
+        // Query and read styles together: a key response can replace the
+        // rows between locator resolution and WebKit's evaluation.
+        const els = [...document.querySelectorAll("#gatewayKeys .key-models, .proto-menu .pm-item")];
         const sheets = [...document.styleSheets].map((s) => { try { return (s.href || "<style>").replace(location.origin, "") + ":" + s.cssRules.length; } catch (e) { return s.href + ":" + e.name; } });
         const bad = els.map((e) => ({ e, s: getComputedStyle(e) })).filter(({ s }) => s.borderLeftStyle !== "none")
           .map(({ e, s }) => ({ tag: e.tagName, cls: e.className, in: e.parentElement?.className, connected: e.isConnected, style: s.borderLeftStyle, width: s.borderLeftWidth, color: s.borderLeftColor }));

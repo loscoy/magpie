@@ -36,7 +36,13 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       const scrolled = async () => [await view.evaluate((v) => v.scrollTop), await page.evaluate(() => window.scrollY)];
       await page.mouse.move(500, 300);
       await page.mouse.wheel(0, 120);
-      await page.waitForTimeout(100);
+      // WebKit animates the wheel; start measuring clicks after it settles.
+      await page.waitForFunction(() => {
+        const top = document.querySelector("#view-gateway").scrollTop, now = performance.now();
+        const last = window.keyScrollSample ||= { top: -1, at: now };
+        if (last.top !== top) Object.assign(last, { top, at: now });
+        return top > 0 && now - last.at > 300;
+      });
       const at = await scrolled();
       // the app's menu, not a native select
       await row("work").hover();
@@ -47,6 +53,22 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.equal((await menu.locator(".pm-head").textContent()).trim(), w.label);
       assert.deepEqual(await scrolled(), at, "opening the menu moved the page");
       assert.equal(await menu.locator(".pm-item.on").count(), 1, "All models is ticked for a free key");
+      // A provider heading folds without selecting or saving anything.
+      const relayGroup = menu.locator(".pm-group").filter({ has: page.locator(".gn", { hasText: /^Relay$/ }) });
+      const fold = relayGroup.locator(".am-fold");
+      await fold.click();
+      assert.equal(await fold.getAttribute("aria-expanded"), "false");
+      assert.equal(await relayGroup.locator(".pm-item").first().isVisible(), false);
+      assert.equal(events.filter((e) => e.action === "models-key").length, 0);
+      // Search opens matching groups, including their ids and accounts;
+      // clearing it restores the reader's folded state.
+      const search = menu.locator("input");
+      await search.fill("m-mini");
+      assert.equal(await menu.locator(".pm-item:visible").count(), 2);
+      assert.equal(await relayGroup.locator(".pm-item", { hasText: "Model mini" }).isVisible(), true);
+      await search.fill("");
+      assert.equal(await fold.getAttribute("aria-expanded"), "false");
+      await fold.click();
       // a short window: the menu stays in it, scrolling, rather than running off it
       // (reduced motion still runs a .01ms transition, so it is waited for)
       await page.waitForFunction(() => {
@@ -75,8 +97,76 @@ for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium",
       assert.deepEqual(await scrolled(), at, "no click moved the page");
       // narrow: the row fits
       await page.setViewportSize({ width: 560, height: 740 });
+      await page.waitForFunction(() => document.documentElement.scrollWidth <= window.innerWidth);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > window.innerWidth), false);
       assert.deepEqual(errors, []);
     });
+  }
+}
+
+for (const engine of (process.env.BROWSER ? [process.env.BROWSER] : ["chromium", "webkit"])) {
+  for (const lang of ["en", "zh", "zh-TW", "ja", "de"]) {
+    for (const width of [1100, 420]) {
+      test(`${engine} ${lang} ${width}: grouped key search preserves hidden permissions`, async (t) => {
+        const browser = await (engine === "webkit" ? webkit.launch() : chromium.launch({ channel: "chromium" }));
+        t.after(() => browser.close());
+        const page = await browser.newPage({ viewport: { width, height: 800 }, reducedMotion: "reduce" });
+        const events = [], errors = [];
+        page.on("pageerror", (e) => errors.push(e.message));
+        const base = fixture(lang, "dark", events, { lan: true, limits: { work: { models: ["old/*", "relay/m"] } } });
+        await page.route("**/*", async (route) => {
+          if (new URL(route.request().url()).pathname !== "/api/caller-keys/models") return base(route);
+          return route.fulfill({ json: {
+            models: [
+              { id: "group/fast", name: "Fast", group: true },
+              ...Array.from({ length: 12 }, (_, i) => ({ id: `relay/${i ? "m-" + i : "m"}`, name: `Model ${i}`, provider: "relay", providerName: "Relay" })),
+              { id: "other/m", name: "Other model", provider: "other", providerName: "Other" },
+            ],
+            accounts: [{ id: "relay/team", name: "Team account", provider: "relay", providerName: "Relay" }],
+          } });
+        });
+        await page.goto("http://magpie.test/?view=gateway");
+        await page.locator('#gatewayKeys [data-key="work"] .key-models').click();
+        const menu = page.locator(".proto-menu");
+        await menu.waitFor();
+        const relay = menu.locator(".pm-group").filter({ has: page.locator(".gn", { hasText: /^Relay$/ }) });
+        assert.equal(await relay.locator(".am-fold").getAttribute("aria-expanded"), "false", "long providers begin folded");
+        assert.equal(await relay.locator(".pm-item").first().isVisible(), false);
+        const pick = relay.locator(".pm-group-pick");
+        assert.equal(await pick.getAttribute("aria-checked"), "mixed");
+        const search = menu.locator("input");
+        await search.fill("m-11");
+        await menu.locator(".pm-item", { hasText: "Model 11" }).click();
+        await search.fill("Team account");
+        await menu.locator(".pm-item", { hasText: "Team account" }).click();
+        await search.fill("not-a-model");
+        assert.equal(await menu.locator(".pm-group:visible").count(), 0);
+        assert.equal(events.filter((e) => e.action === "models-key").length, 0);
+        await search.fill("");
+        assert.equal(await relay.locator(".am-fold").getAttribute("aria-expanded"), "false");
+        await relay.locator(".am-fold").focus();
+        await page.keyboard.press("ArrowDown");
+        assert.equal(await page.evaluate(() => document.activeElement.matches(".pm-group-pick")), true, "keyboard reaches the next group without entering folded rows");
+        await pick.click();
+        assert.equal(await pick.getAttribute("aria-checked"), "true");
+        await pick.click();
+        assert.equal(await pick.getAttribute("aria-checked"), "false");
+        assert.equal(await relay.locator(".pm-item.on").count(), 1, "clearing all models preserves the selected account");
+        assert.match(await relay.locator(".pm-item.on").textContent(), /Team account/);
+        await pick.focus();
+        await page.keyboard.press("Space");
+        assert.equal(await pick.getAttribute("aria-checked"), "true");
+        const box = await menu.boundingBox();
+        assert(box.x >= 0 && box.x + box.width <= width && box.y + box.height <= 800, JSON.stringify(box));
+        await page.keyboard.press("Escape");
+        await page.waitForFunction(() => !document.querySelector(".proto-menu"));
+        await page.waitForFunction(() => document.querySelector('#gatewayKeys [data-key="work"] .key-models').title.includes("relay/*"));
+        assert.deepEqual(events.find((e) => e.action === "models-key").body, { key: "work", models: ["relay/*", "old/*"] });
+        // The account write follows the model write; wait for both responses.
+        await page.waitForFunction(() => document.querySelector('#gatewayKeys [data-key="work"] .key-models').title.includes("relay/team"));
+        assert.deepEqual(events.find((e) => e.action === "accounts-key").body, { key: "work", accounts: ["relay/team"] });
+        assert.deepEqual(errors, []);
+      });
+    }
   }
 }

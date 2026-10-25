@@ -35,6 +35,29 @@ three.
 
 ## Constraints and failure behavior
 
+### Gateway key model picker
+
+`gatewayModelsBadge` in `assets/plugins/gateway/keys.js` uses the shared
+`openProtoMenu` with collapsible groups: routing groups first, then each
+provider's models and accounts under separate labels, and saved entries
+not currently offered in their own groups. Group identities use provider
+ids, not display names. The heading's arrow folds; its separate checkbox
+selects the group's wildcard, replacing individual model picks, or clears
+that group's model picks. Account restrictions remain unchanged. A partial
+model selection shows a mixed checkbox; missing-entry groups have no bulk
+selection. The heading's count is selected rules, not the number of models
+a wildcard authorizes. Headings use medium-weight secondary text; counts
+remain faint.
+Groups longer than eight entries start folded, as in the Agents picker.
+Search matches labels, ids and provider names across folded groups;
+clearing it restores their fold state. Filtering never removes a selection.
+Arrow navigation skips folded or filtered entries, and Escape or an
+outside click saves the selection as before. `provider/*` remains a rule
+covering future models, distinct from selecting the current models one
+by one; All models clears both model and account restrictions. Covered by
+`gateway-key-models.test.cjs`, including both engines, all five languages
+and narrow windows.
+
 ### Allowance card refreshes
 
 A card refresh applies only the requested account from the API's full

@@ -14831,7 +14831,7 @@ function placeMenu(box, anchor, align = "left", dx = 0) {
   box.style.left = Math.max(pad, Math.min(left, innerWidth - w - pad)) + "px";
   box.style.top = Math.max(top, y) + "px";
 }
-function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key speaks", cls = "", align = "left", live = false, search = "") {
+function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key speaks", cls = "", align = "left", live = false, search = "", layout = null) {
   closeProtoMenu();
   const multi = Array.isArray(value);
   let picked = multi ? [...value] : null;
@@ -14869,6 +14869,7 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
       if (!o.v) { picked = []; closeProtoMenu(); if (live) choose([]); return; }
       picked = picked.includes(o.v) ? picked.filter((v) => v !== o.v) : [...picked, o.v];
       items.forEach((it, i) => tick(it, opts[i]));
+      filterItems();
       if (live) {
         choose(opts.map((o) => o.v).filter((v) => picked.includes(v)));
         b.focus({ preventScroll: true });
@@ -14878,10 +14879,15 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
     box.append(b);
     return b;
   });
-  if (filter) filter.oninput = () => {
-    const q = filter.value.trim().toLocaleLowerCase();
+  // Plugins arrange items; the menu owns selection and dismissal.
+  const arranged = layout?.(box, opts, items, isOn);
+  const filterItems = () => {
+    const q = filter?.value.trim().toLocaleLowerCase() || "";
+    if (arranged) return arranged(q);
     items.forEach((b, i) => { b.hidden = !opts[i].always && !opts[i].name.toLocaleLowerCase().includes(q); });
   };
+  filterItems();
+  if (filter) filter.oninput = filterItems;
   document.body.append(box);
   placeMenu(box, anchor, align);
   anchor.classList.add("open");
@@ -14894,7 +14900,7 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
     if (scrollCloses(box, e)) closeProtoMenu();
   };
   const keys = (e) => {
-    const shown = filter ? items.filter((b) => !b.hidden) : items;
+    const shown = arranged ? [...box.querySelectorAll("button")].filter((b) => !b.closest("[hidden]")) : filter ? items.filter((b) => !b.hidden) : items;
     const i = shown.indexOf(document.activeElement);
     if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); closeProtoMenu(); anchor.focus(); }
     else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
@@ -14902,7 +14908,7 @@ function openProtoMenu(anchor, opts, value, choose, head = "Protocol this key sp
       const n = shown.length, from = i < 0 ? (e.key === "ArrowDown" ? n - 1 : 0) : i;
       if (n) shown[(from + (e.key === "ArrowDown" ? 1 : n - 1)) % n].focus();
     } else if (filter && e.key === "Enter" && document.activeElement === filter) {
-      const first = shown.find((b) => !opts[items.indexOf(b)].always);
+      const first = shown.find((b) => items.includes(b) && !opts[items.indexOf(b)].always);
       if (first) { e.preventDefault(); first.click(); }
     } else if (filter && (e.key === "Home" || e.key === "End") && i >= 0) {
       e.preventDefault();

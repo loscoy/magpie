@@ -20,6 +20,9 @@ const (
 )
 
 func TestCoreScriptBudget(t *testing.T) {
+	// The shared menu's plugin layout hook and keyboard navigation add 361
+	// bytes (#2496). Grouping itself stays in the gateway plugin.
+	const menuLayoutBytes = 361
 	page, err := os.ReadFile("assets/index.html")
 	if err != nil {
 		t.Fatal(err)
@@ -37,8 +40,8 @@ func TestCoreScriptBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if name == "app.js" && len(b) > appScriptBudget {
-			t.Errorf("app.js is %d bytes, over its budget of %d: put the page's code in its plugin, or raise the budget and say why", len(b), appScriptBudget)
+		if name == "app.js" && len(b) > appScriptBudget+menuLayoutBytes {
+			t.Errorf("app.js is %d bytes, over its budget of %d: put the page's code in its plugin, or raise the budget and say why", len(b), appScriptBudget+menuLayoutBytes)
 		}
 		total += len(b)
 		n++
@@ -46,7 +49,7 @@ func TestCoreScriptBudget(t *testing.T) {
 	if n < 5 {
 		t.Fatalf("found only %d core scripts in index.html", n)
 	}
-	if total > coreScriptBudget {
-		t.Errorf("the core's scripts are %d bytes, over their budget of %d: put the page's code in its plugin, or raise the budget and say why", total, coreScriptBudget)
+	if total > coreScriptBudget+menuLayoutBytes {
+		t.Errorf("the core's scripts are %d bytes, over their budget of %d: put the page's code in its plugin, or raise the budget and say why", total, coreScriptBudget+menuLayoutBytes)
 	}
 }
